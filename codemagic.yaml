@@ -1,0 +1,91 @@
+# Songly CI. Pin `flutter:` to `flutter --version` on your Pi.
+definitions:
+  env_versions: &env_versions
+    flutter: 3.44.6
+    java: 21
+  scripts:
+    - &write_env
+      name: Write dart_define.json from Codemagic env vars
+      script: |
+        cat > dart_define.json <<JSON
+        {
+          "YT_API_KEY": "$YT_API_KEY",
+          "MB_CONTACT": "$MB_CONTACT",
+          "APP_VERSION": "$FCI_BUILD_ID"
+        }
+        JSON
+    - &pub_get
+      name: Dependencies
+      script: flutter pub get
+    - &analyze
+      name: Analyze
+      script: flutter analyze --no-fatal-infos
+
+workflows:
+  android-debug:
+    name: Songly Android (debug APK)
+    instance_type: linux_x2
+    max_build_duration: 45
+    environment:
+      <<: *env_versions
+      groups:
+        - songly_secrets   # YT_API_KEY (secure), MB_CONTACT
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: dev
+          include: true
+        - pattern: 'feat/*'
+          include: true
+    scripts:
+      - *write_env
+      - *pub_get
+      - *analyze
+      - name: Build debug APK
+        script: |
+          flutter build apk --debug \
+            --dart-define-from-file=dart_define.json
+    artifacts:
+      - build/**/outputs/**/*.apk
+    publishing:
+      email:
+        recipients:
+          - aryan@example.com
+        notify:
+          success: true
+          failure: true
+
+  android-release:
+    name: Songly Android (release AAB + APK)
+    instance_type: linux_x2
+    max_build_duration: 60
+    environment:
+      <<: *env_versions
+      groups:
+        - songly_secrets
+      android_signing:
+        - songly_keystore   # upload your keystore in Codemagic first (M8)
+    triggering:
+      events:
+        - tag
+      tag_patterns:
+        - pattern: 'v*'
+          include: true
+    scripts:
+      - *write_env
+      - *pub_get
+      - *analyze
+      - name: Build release
+        script: |
+          flutter build apk --release \
+            --dart-define-from-file=dart_define.json
+          flutter build appbundle --release \
+            --dart-define-from-file=dart_define.json
+    artifacts:
+      - build/**/outputs/**/*.apk
+      - build/**/outputs/**/*.aab
+    publishing:
+      email:
+        recipients:
+          - aryan@example.com

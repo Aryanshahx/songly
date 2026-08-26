@@ -1,0 +1,2012 @@
+#!/usr/bin/env bash
+# ==========================================================================
+#  Songly - M0 Foundations installer
+#  Run this from the ROOT of your existing Flutter project (where pubspec.yaml
+#  lives), in the IntelliJ terminal:
+#
+#      bash m0_setup.sh
+#
+#  It is safe to re-run. It adds packages, writes lib/ files, patches the
+#  Android manifest, then analyzes. NOTHING here needs code generation, so you
+#  get a green build immediately.
+# ==========================================================================
+set -euo pipefail
+
+if [ ! -f pubspec.yaml ]; then
+  echo "ERROR: no pubspec.yaml here. cd into your Songly project root first."
+  exit 1
+fi
+
+echo "==> Flutter version (pin this exact version in codemagic.yaml)"
+flutter --version
+
+echo "==> Trimming platforms: Android (release) + Web (fast dev on the Pi)"
+flutter config --no-enable-ios --no-enable-macos-desktop \
+               --no-enable-windows-desktop --no-enable-linux-desktop >/dev/null
+flutter config --enable-web >/dev/null
+
+echo "==> Adding runtime packages"
+flutter pub add \
+  flutter_riverpod riverpod_annotation \
+  dio go_router \
+  youtube_player_iframe \
+  hive_ce hive_ce_flutter path_provider \
+  cached_network_image palette_generator \
+  connectivity_plus share_plus url_launcher intl \
+  freezed_annotation json_annotation collection uuid
+
+echo "==> Adding dev packages (codegen starts in M1)"
+flutter pub add --dev \
+  build_runner freezed json_serializable \
+  riverpod_generator riverpod_lint custom_lint flutter_lints
+
+echo "==> Creating folders"
+mkdir -p lib/app/theme
+mkdir -p lib/core/config lib/core/network lib/core/storage lib/core/errors lib/core/utils
+mkdir -p lib/shared/widgets
+mkdir -p lib/features/search/data lib/features/search/domain lib/features/search/presentation
+mkdir -p lib/features/album/data lib/features/album/domain lib/features/album/presentation
+mkdir -p lib/features/artist/data lib/features/artist/domain lib/features/artist/presentation
+mkdir -p lib/features/player/data lib/features/player/domain lib/features/player/presentation
+mkdir -p lib/features/resolver/data lib/features/resolver/domain lib/features/resolver/presentation
+mkdir -p lib/features/library/data lib/features/library/domain lib/features/library/presentation
+mkdir -p lib/features/home/data lib/features/home/domain lib/features/home/presentation
+mkdir -p lib/features/lyrics/data lib/features/lyrics/domain lib/features/lyrics/presentation
+mkdir -p lib/features/settings/presentation
+mkdir -p tools
+
+echo "==> Writing files"
+echo "    analysis_options.yaml"
+cat > analysis_options.yaml <<'SONGLY_EOF'
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  errors:
+    invalid_annotation_target: ignore
+  exclude:
+    - "**/*.g.dart"
+    - "**/*.freezed.dart"
+
+linter:
+  rules:
+    prefer_single_quotes: true
+    always_declare_return_types: true
+    avoid_print: true
+    require_trailing_commas: true
+    use_super_parameters: true
+SONGLY_EOF
+
+echo "    codemagic.yaml"
+cat > codemagic.yaml <<'SONGLY_EOF'
+# Songly CI. Pin `flutter:` to whatever `flutter --version` prints on your Pi.
+definitions:
+  env_versions: &env_versions
+    flutter: 3.44.9
+    java: 21
+  scripts:
+    - &write_env
+      name: Write dart_define.json from Codemagic env vars
+      script: |
+        cat > dart_define.json <<JSON
+        {
+          "YT_API_KEY": "$YT_API_KEY",
+          "MB_CONTACT": "$MB_CONTACT",
+          "APP_VERSION": "$FCI_BUILD_ID"
+        }
+        JSON
+    - &pub_get
+      name: Dependencies
+      script: flutter pub get
+    - &analyze
+      name: Analyze
+      script: flutter analyze --no-fatal-infos
+
+workflows:
+  android-debug:
+    name: Songly Android (debug APK)
+    instance_type: linux_x2
+    max_build_duration: 45
+    environment:
+      <<: *env_versions
+      groups:
+        - songly_secrets   # YT_API_KEY (secure), MB_CONTACT
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: dev
+          include: true
+        - pattern: 'feat/*'
+          include: true
+    scripts:
+      - *write_env
+      - *pub_get
+      - *analyze
+      - name: Build debug APK
+        script: |
+          flutter build apk --debug \
+            --dart-define-from-file=dart_define.json
+    artifacts:
+      - build/**/outputs/**/*.apk
+    publishing:
+      email:
+        recipients:
+          - you@example.com
+        notify:
+          success: true
+          failure: true
+
+  android-release:
+    name: Songly Android (release AAB + APK)
+    instance_type: linux_x2
+    max_build_duration: 60
+    environment:
+      <<: *env_versions
+      groups:
+        - songly_secrets
+      android_signing:
+        - songly_keystore   # upload your keystore in Codemagic first (M8)
+    triggering:
+      events:
+        - tag
+      tag_patterns:
+        - pattern: 'v*'
+          include: true
+    scripts:
+      - *write_env
+      - *pub_get
+      - *analyze
+      - name: Build release
+        script: |
+          flutter build apk --release \
+            --dart-define-from-file=dart_define.json
+          flutter build appbundle --release \
+            --dart-define-from-file=dart_define.json
+    artifacts:
+      - build/**/outputs/**/*.apk
+      - build/**/outputs/**/*.aab
+    publishing:
+      email:
+        recipients:
+          - you@example.com
+SONGLY_EOF
+
+echo "    lib/app/app.dart"
+cat > lib/app/app.dart <<'SONGLY_EOF'
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import 'router.dart';
+import 'theme/app_theme.dart';
+
+class SonglyApp extends ConsumerWidget {
+  const SonglyApp({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return MaterialApp.router(
+      title: 'Songly',
+      debugShowCheckedModeBanner: false,
+      theme: AppTheme.dark(),
+      darkTheme: AppTheme.dark(),
+      themeMode: ThemeMode.dark,
+      routerConfig: ref.watch(routerProvider),
+    );
+  }
+}
+SONGLY_EOF
+
+echo "    lib/app/router.dart"
+cat > lib/app/router.dart <<'SONGLY_EOF'
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+
+import '../features/home/presentation/home_screen.dart';
+import '../features/library/presentation/library_screen.dart';
+import '../features/search/presentation/search_screen.dart';
+import '../features/settings/presentation/settings_screen.dart';
+import '../shared/widgets/app_shell.dart';
+
+/// Routes. The three tabs live inside a [StatefulShellRoute] so each tab keeps
+/// its own navigation state AND — critically — the mini player in [AppShell] is
+/// never rebuilt/disposed when you switch tabs. That is what will keep the
+/// YouTube iFrame webview alive across navigation in M3.
+final routerProvider = Provider<GoRouter>((ref) {
+  return GoRouter(
+    initialLocation: '/home',
+    debugLogDiagnostics: true,
+    routes: <RouteBase>[
+      StatefulShellRoute.indexedStack(
+        builder: (context, state, navigationShell) =>
+            AppShell(shell: navigationShell),
+        branches: <StatefulShellBranch>[
+          StatefulShellBranch(
+            routes: <RouteBase>[
+              GoRoute(
+                path: '/home',
+                builder: (context, state) => const HomeScreen(),
+              ),
+            ],
+          ),
+          StatefulShellBranch(
+            routes: <RouteBase>[
+              GoRoute(
+                path: '/search',
+                builder: (context, state) => const SearchScreen(),
+              ),
+            ],
+          ),
+          StatefulShellBranch(
+            routes: <RouteBase>[
+              GoRoute(
+                path: '/library',
+                builder: (context, state) => const LibraryScreen(),
+              ),
+            ],
+          ),
+        ],
+      ),
+      GoRoute(
+        path: '/settings',
+        builder: (context, state) => const SettingsScreen(),
+      ),
+    ],
+  );
+});
+SONGLY_EOF
+
+echo "    lib/app/theme/app_theme.dart"
+cat > lib/app/theme/app_theme.dart <<'SONGLY_EOF'
+import 'package:flutter/material.dart';
+
+class AppColors {
+  const AppColors._();
+
+  static const Color bg = Color(0xFF0B0B0F);
+  static const Color surface = Color(0xFF15151C);
+  static const Color surfaceHigh = Color(0xFF1E1E28);
+  static const Color accent = Color(0xFF00E5A0);
+  static const Color accentAlt = Color(0xFF7C5CFF);
+  static const Color textDim = Color(0xFF9A9AA8);
+  static const Color danger = Color(0xFFFF5470);
+}
+
+class AppTheme {
+  const AppTheme._();
+
+  static ThemeData dark() {
+    final ColorScheme scheme = ColorScheme.fromSeed(
+      seedColor: AppColors.accent,
+      brightness: Brightness.dark,
+    ).copyWith(
+      primary: AppColors.accent,
+      onPrimary: Colors.black,
+      secondary: AppColors.accentAlt,
+      surface: AppColors.surface,
+      error: AppColors.danger,
+    );
+
+    return ThemeData(
+      useMaterial3: true,
+      colorScheme: scheme,
+      scaffoldBackgroundColor: AppColors.bg,
+      splashFactory: InkSparkle.splashFactory,
+      appBarTheme: const AppBarTheme(
+        backgroundColor: Colors.transparent,
+        surfaceTintColor: Colors.transparent,
+        elevation: 0,
+        centerTitle: false,
+        titleTextStyle: TextStyle(
+          fontSize: 22,
+          fontWeight: FontWeight.w800,
+          letterSpacing: -0.4,
+          color: Colors.white,
+        ),
+      ),
+      navigationBarTheme: NavigationBarThemeData(
+        backgroundColor: AppColors.surface,
+        surfaceTintColor: Colors.transparent,
+        elevation: 0,
+        height: 64,
+        indicatorColor: AppColors.accent.withValues(alpha: 0.16),
+        labelTextStyle: const WidgetStatePropertyAll<TextStyle>(
+          TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
+        ),
+      ),
+      listTileTheme: const ListTileThemeData(
+        iconColor: AppColors.textDim,
+        titleTextStyle: TextStyle(
+          fontSize: 15,
+          fontWeight: FontWeight.w600,
+          color: Colors.white,
+        ),
+        subtitleTextStyle: TextStyle(fontSize: 13, color: AppColors.textDim),
+      ),
+      inputDecorationTheme: InputDecorationTheme(
+        filled: true,
+        fillColor: AppColors.surfaceHigh,
+        hintStyle: const TextStyle(color: AppColors.textDim),
+        prefixIconColor: AppColors.textDim,
+        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(14),
+          borderSide: BorderSide.none,
+        ),
+      ),
+      sliderTheme: const SliderThemeData(
+        trackHeight: 3,
+        activeTrackColor: AppColors.accent,
+        inactiveTrackColor: AppColors.surfaceHigh,
+        thumbColor: Colors.white,
+      ),
+      dividerTheme: const DividerThemeData(
+        color: Color(0xFF23232E),
+        thickness: 1,
+        space: 1,
+      ),
+      textTheme: const TextTheme(
+        headlineSmall: TextStyle(fontWeight: FontWeight.w800, letterSpacing: -0.5),
+        titleMedium: TextStyle(fontWeight: FontWeight.w700),
+        bodyMedium: TextStyle(color: Colors.white),
+        bodySmall: TextStyle(color: AppColors.textDim),
+      ),
+    );
+  }
+
+  /// Spotify-style gradient used behind headers and the now-playing screen.
+  static LinearGradient headerGradient(Color seed) => LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: <Color>[
+          seed.withValues(alpha: 0.55),
+          seed.withValues(alpha: 0.12),
+          AppColors.bg,
+        ],
+        stops: const <double>[0.0, 0.45, 1.0],
+      );
+}
+SONGLY_EOF
+
+echo "    lib/core/config/env.dart"
+cat > lib/core/config/env.dart <<'SONGLY_EOF'
+/// Compile-time configuration.
+///
+/// Values arrive via `--dart-define-from-file=dart_define.json` locally and via
+/// Codemagic environment variables in CI. Nothing secret is hardcoded here.
+class Env {
+  const Env._();
+
+  static const String ytApiKey = String.fromEnvironment('YT_API_KEY');
+  static const String mbContact =
+      String.fromEnvironment('MB_CONTACT', defaultValue: 'songly@example.com');
+  static const String appVersion =
+      String.fromEnvironment('APP_VERSION', defaultValue: '1.0.0');
+
+  /// Point this at http://localhost:8787 to use tools/mb_proxy.dart during web
+  /// development on the Pi (browsers cannot set a User-Agent header).
+  static const String mbBaseUrl = String.fromEnvironment(
+    'MB_BASE_URL',
+    defaultValue: 'https://musicbrainz.org/ws/2',
+  );
+
+  static const String ytBaseUrl = 'https://www.googleapis.com/youtube/v3';
+  static const String coverArtBaseUrl = 'https://coverartarchive.org';
+  static const String lyricsBaseUrl = 'https://lrclib.net/api';
+  static const String listenBrainzBaseUrl = 'https://labs.api.listenbrainz.org';
+
+  static bool get hasYouTubeKey => ytApiKey.isNotEmpty;
+
+  /// MusicBrainz REQUIRES a descriptive User-Agent with contact info.
+  static String get userAgent => 'Songly/$appVersion ( $mbContact )';
+}
+SONGLY_EOF
+
+echo "    lib/core/errors/failure.dart"
+cat > lib/core/errors/failure.dart <<'SONGLY_EOF'
+import 'package:dio/dio.dart';
+
+sealed class Failure implements Exception {
+  const Failure(this.message);
+  final String message;
+
+  @override
+  String toString() => '$runtimeType: $message';
+
+  static Failure from(Object error) {
+    if (error is Failure) return error;
+    if (error is DioException) {
+      final int? code = error.response?.statusCode;
+      if (code == 503 || code == 429) {
+        return const RateLimitFailure(
+          'The music database is busy. Trying again shortly.',
+        );
+      }
+      if (code == 403) {
+        final String body = error.response?.data?.toString() ?? '';
+        if (body.contains('quotaExceeded') || body.contains('quota')) {
+          return const QuotaFailure(
+            'Daily YouTube lookup limit reached. Cached songs still play.',
+          );
+        }
+        return const UnknownFailure('Access denied by the service (403).');
+      }
+      if (code == 404) return const NotFoundFailure('Not found.');
+      return switch (error.type) {
+        DioExceptionType.connectionTimeout ||
+        DioExceptionType.receiveTimeout ||
+        DioExceptionType.sendTimeout =>
+          const NetworkFailure('Connection timed out.'),
+        DioExceptionType.connectionError =>
+          const NetworkFailure('No internet connection.'),
+        _ => UnknownFailure(error.message ?? 'Something went wrong.'),
+      };
+    }
+    return UnknownFailure(error.toString());
+  }
+}
+
+class NetworkFailure extends Failure {
+  const NetworkFailure(super.message);
+}
+
+class RateLimitFailure extends Failure {
+  const RateLimitFailure(super.message);
+}
+
+class QuotaFailure extends Failure {
+  const QuotaFailure(super.message);
+}
+
+class NotFoundFailure extends Failure {
+  const NotFoundFailure(super.message);
+}
+
+class UnknownFailure extends Failure {
+  const UnknownFailure(super.message);
+}
+SONGLY_EOF
+
+echo "    lib/core/network/dio_client.dart"
+cat > lib/core/network/dio_client.dart <<'SONGLY_EOF'
+import 'package:dio/dio.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../config/env.dart';
+import '../storage/hive_boxes.dart';
+import 'hive_cache_interceptor.dart';
+import 'rate_limit_interceptor.dart';
+import 'user_agent_interceptor.dart';
+
+/// MusicBrainz client: User-Agent -> cache -> rate limit -> backoff.
+/// Order matters: the cache runs BEFORE the rate limiter, so cache hits are
+/// instant instead of waiting in the 1 req/s queue.
+final Provider<Dio> mbDioProvider = Provider<Dio>((ref) {
+  final Dio dio = Dio(
+    BaseOptions(
+      baseUrl: Env.mbBaseUrl,
+      connectTimeout: const Duration(seconds: 12),
+      receiveTimeout: const Duration(seconds: 20),
+      queryParameters: <String, dynamic>{'fmt': 'json'},
+      headers: <String, dynamic>{'Accept': 'application/json'},
+      responseType: ResponseType.json,
+    ),
+  );
+  dio.interceptors.addAll(<Interceptor>[
+    UserAgentInterceptor(),
+    HiveCacheInterceptor(ttl: const Duration(days: 30)),
+    RateLimitInterceptor(),
+    BackoffInterceptor(),
+  ]);
+  return dio;
+});
+
+/// YouTube Data API client. Cache TTL is deliberately huge: a videoId for a
+/// song does not change, so we should never pay for the same lookup twice.
+final Provider<Dio> ytDioProvider = Provider<Dio>((ref) {
+  final Dio dio = Dio(
+    BaseOptions(
+      baseUrl: Env.ytBaseUrl,
+      connectTimeout: const Duration(seconds: 12),
+      receiveTimeout: const Duration(seconds: 20),
+      responseType: ResponseType.json,
+    ),
+  );
+  dio.interceptors.addAll(<Interceptor>[
+    HiveCacheInterceptor(ttl: const Duration(days: 365)),
+    BackoffInterceptor(maxRetries: 1),
+  ]);
+  return dio;
+});
+
+/// Plain client for Cover Art Archive / LRCLIB / ListenBrainz.
+final Provider<Dio> plainDioProvider = Provider<Dio>((ref) {
+  final Dio dio = Dio(
+    BaseOptions(
+      connectTimeout: const Duration(seconds: 12),
+      receiveTimeout: const Duration(seconds: 20),
+    ),
+  );
+  dio.interceptors.addAll(<Interceptor>[
+    UserAgentInterceptor(),
+    HiveCacheInterceptor(ttl: const Duration(days: 14)),
+  ]);
+  return dio;
+});
+
+/// Convenience so features can read cache stats without touching Hive.
+int cachedResponseCount() => HiveBoxes.box(HiveBoxes.httpCache).length;
+SONGLY_EOF
+
+echo "    lib/core/network/hive_cache_interceptor.dart"
+cat > lib/core/network/hive_cache_interceptor.dart <<'SONGLY_EOF'
+import 'dart:convert';
+
+import 'package:dio/dio.dart';
+import 'package:hive_ce_flutter/hive_ce_flutter.dart';
+
+import '../storage/hive_boxes.dart';
+
+/// Disk cache for GET requests.
+///
+/// Three jobs:
+///  1. Serve fresh cached responses instantly (and skip the rate limiter).
+///  2. Save MusicBrainz from repeat calls - MBID data barely ever changes.
+///  3. Serve STALE data when the network fails, so the app works offline.
+class HiveCacheInterceptor extends Interceptor {
+  HiveCacheInterceptor({
+    this.boxName = HiveBoxes.httpCache,
+    this.ttl = const Duration(days: 30),
+  });
+
+  final String boxName;
+  final Duration ttl;
+
+  Box<dynamic> get _box => HiveBoxes.box(boxName);
+
+  String _key(RequestOptions o) => o.uri.toString();
+
+  @override
+  void onRequest(RequestOptions options, RequestInterceptorHandler handler) {
+    if (options.method != 'GET' || options.extra['no_cache'] == true) {
+      handler.next(options);
+      return;
+    }
+
+    final Map<dynamic, dynamic>? entry =
+        _box.get(_key(options)) as Map<dynamic, dynamic>?;
+    if (entry != null) {
+      final int ts = (entry['ts'] as int?) ?? 0;
+      final bool fresh = DateTime.now()
+              .difference(DateTime.fromMillisecondsSinceEpoch(ts)) <
+          ttl;
+      if (fresh) {
+        handler.resolve(
+          Response<dynamic>(
+            requestOptions: options,
+            statusCode: 200,
+            data: jsonDecode(entry['body'] as String),
+            extra: <String, dynamic>{'from_cache': true},
+          ),
+        );
+        return;
+      }
+    }
+    handler.next(options);
+  }
+
+  @override
+  void onResponse(
+    Response<dynamic> response,
+    ResponseInterceptorHandler handler,
+  ) {
+    final bool cacheable = response.requestOptions.method == 'GET' &&
+        response.statusCode == 200 &&
+        response.extra['from_cache'] != true &&
+        (response.data is Map || response.data is List);
+
+    if (cacheable) {
+      _box.put(_key(response.requestOptions), <String, dynamic>{
+        'ts': DateTime.now().millisecondsSinceEpoch,
+        'body': jsonEncode(response.data),
+      });
+    }
+    handler.next(response);
+  }
+
+  @override
+  void onError(DioException err, ErrorInterceptorHandler handler) {
+    final Map<dynamic, dynamic>? entry =
+        _box.get(_key(err.requestOptions)) as Map<dynamic, dynamic>?;
+    if (entry != null) {
+      handler.resolve(
+        Response<dynamic>(
+          requestOptions: err.requestOptions,
+          statusCode: 200,
+          data: jsonDecode(entry['body'] as String),
+          extra: <String, dynamic>{'from_cache': true, 'stale': true},
+        ),
+      );
+      return;
+    }
+    handler.next(err);
+  }
+}
+SONGLY_EOF
+
+echo "    lib/core/network/quota_ledger.dart"
+cat > lib/core/network/quota_ledger.dart <<'SONGLY_EOF'
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:hive_ce_flutter/hive_ce_flutter.dart';
+
+import '../storage/hive_boxes.dart';
+
+/// Tracks what we spend on the YouTube Data API so the app degrades with a
+/// clear message instead of dying on a 403.
+///
+/// Reminder of the economics:
+///   search.list      = 100 units (own ~100 call/day bucket) -> SCARCE
+///   videos.list      = 1 unit    -> cheap
+///   channels.list    = 1 unit    -> cheap
+///   playlistItems    = 1 unit / 50 videos -> how we harvest whole catalogues
+class QuotaLedger {
+  QuotaLedger(this._box);
+
+  final Box<dynamic> _box;
+
+  static const int defaultSearchCap = 30;
+  static const int searchUnitCost = 100;
+  static const int dailyUnitPool = 10000;
+
+  static String dayKey([DateTime? at]) {
+    final DateTime d = at ?? DateTime.now();
+    final String m = d.month.toString().padLeft(2, '0');
+    final String day = d.day.toString().padLeft(2, '0');
+    return '${d.year}-$m-$day';
+  }
+
+  int get searchCap =>
+      (HiveBoxes.box(HiveBoxes.settings).get('search_cap') as int?) ??
+      defaultSearchCap;
+
+  int get searchesToday => (_box.get('s_${dayKey()}') as int?) ?? 0;
+  int get unitsToday => (_box.get('u_${dayKey()}') as int?) ?? 0;
+
+  bool get canSearch => searchesToday < searchCap;
+  int get searchesLeft => (searchCap - searchesToday).clamp(0, searchCap);
+
+  double get searchFraction =>
+      searchCap == 0 ? 1 : (searchesToday / searchCap).clamp(0.0, 1.0);
+
+  Future<void> spendSearch([int n = 1]) =>
+      _box.put('s_${dayKey()}', searchesToday + n);
+
+  Future<void> spendUnits(int n) => _box.put('u_${dayKey()}', unitsToday + n);
+
+  /// Called when Google returns 403 quotaExceeded: stop trying today.
+  Future<void> markExhausted() => _box.put('s_${dayKey()}', searchCap);
+
+  Future<void> setSearchCap(int cap) =>
+      HiveBoxes.box(HiveBoxes.settings).put('search_cap', cap);
+}
+
+final Provider<QuotaLedger> quotaLedgerProvider = Provider<QuotaLedger>(
+  (ref) => QuotaLedger(HiveBoxes.box(HiveBoxes.quota)),
+);
+SONGLY_EOF
+
+echo "    lib/core/network/rate_limit_interceptor.dart"
+cat > lib/core/network/rate_limit_interceptor.dart <<'SONGLY_EOF'
+import 'dart:async';
+
+import 'package:dio/dio.dart';
+
+/// Serialises outgoing requests so we never exceed MusicBrainz's hard limit of
+/// one request per second. Requests queue up politely instead of racing and
+/// earning us a 503 / IP block.
+///
+/// The lock is held only until the request is *dispatched*, not until the
+/// response arrives, so throughput stays at ~1 req/s rather than 1 round-trip/s.
+class RateLimitInterceptor extends Interceptor {
+  RateLimitInterceptor({this.minGap = const Duration(milliseconds: 1100)});
+
+  final Duration minGap;
+
+  Future<void> _tail = Future<void>.value();
+  DateTime _last = DateTime.fromMillisecondsSinceEpoch(0);
+
+  @override
+  Future<void> onRequest(
+    RequestOptions options,
+    RequestInterceptorHandler handler,
+  ) async {
+    final Completer<void> gate = Completer<void>();
+    final Future<void> previous = _tail;
+    _tail = gate.future;
+    try {
+      await previous;
+      final Duration wait = minGap - DateTime.now().difference(_last);
+      if (wait > Duration.zero) {
+        await Future<void>.delayed(wait);
+      }
+      _last = DateTime.now();
+      handler.next(options);
+    } finally {
+      if (!gate.isCompleted) gate.complete();
+    }
+  }
+}
+
+/// Retries 503 (rate limited) and 429 with backoff, honouring Retry-After.
+class BackoffInterceptor extends Interceptor {
+  BackoffInterceptor({this.maxRetries = 3});
+
+  final int maxRetries;
+
+  @override
+  Future<void> onError(
+    DioException err,
+    ErrorInterceptorHandler handler,
+  ) async {
+    final int? status = err.response?.statusCode;
+    final bool retryable = status == 503 || status == 429 || status == 500;
+    final int attempt = (err.requestOptions.extra['retry_attempt'] as int?) ?? 0;
+
+    if (!retryable || attempt >= maxRetries) {
+      handler.next(err);
+      return;
+    }
+
+    final String? retryAfter =
+        err.response?.headers.value('retry-after');
+    final Duration delay = retryAfter != null
+        ? Duration(seconds: int.tryParse(retryAfter) ?? 2)
+        : Duration(milliseconds: 700 * (1 << attempt) + attempt * 150);
+
+    await Future<void>.delayed(delay);
+
+    final RequestOptions retryOptions = err.requestOptions
+      ..extra['retry_attempt'] = attempt + 1;
+
+    try {
+      final Response<dynamic> response =
+          await Dio().fetch<dynamic>(retryOptions);
+      handler.resolve(response);
+    } on DioException catch (e) {
+      handler.next(e);
+    }
+  }
+}
+SONGLY_EOF
+
+echo "    lib/core/network/user_agent_interceptor.dart"
+cat > lib/core/network/user_agent_interceptor.dart <<'SONGLY_EOF'
+import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
+
+import '../config/env.dart';
+
+/// MusicBrainz requires a descriptive User-Agent. Browsers forbid setting it,
+/// so on web we skip it and rely on tools/mb_proxy.dart to inject it instead.
+class UserAgentInterceptor extends Interceptor {
+  @override
+  void onRequest(
+    RequestOptions options,
+    RequestInterceptorHandler handler,
+  ) {
+    if (!kIsWeb) {
+      options.headers['User-Agent'] = Env.userAgent;
+    }
+    handler.next(options);
+  }
+}
+SONGLY_EOF
+
+echo "    lib/core/storage/hive_boxes.dart"
+cat > lib/core/storage/hive_boxes.dart <<'SONGLY_EOF'
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:hive_ce_flutter/hive_ce_flutter.dart';
+
+/// All local storage in one place. Boxes hold plain JSON-able maps in M0 so we
+/// need zero code generation to get a green build.
+class HiveBoxes {
+  const HiveBoxes._();
+
+  /// recording MBID -> {videoId, score, candidates, resolvedAt, unplayable}
+  static const String resolver = 'resolver';
+
+  /// artist MBID -> {channelId, uploadsPlaylistId, source}
+  static const String artistChannels = 'artist_channels';
+
+  /// artist MBID -> {normalizedTitle: videoId, ...} (harvested catalogue)
+  static const String artistCatalog = 'artist_catalog';
+
+  /// request URL -> {ts, body} HTTP cache (MusicBrainz + YouTube reads)
+  static const String httpCache = 'http_cache';
+
+  static const String liked = 'liked';
+  static const String playlists = 'playlists';
+  static const String history = 'history';
+  static const String settings = 'settings';
+
+  /// 's_yyyy-MM-dd' -> searches used, 'u_yyyy-MM-dd' -> cheap units used
+  static const String quota = 'quota';
+
+  static const List<String> all = <String>[
+    resolver,
+    artistChannels,
+    artistCatalog,
+    httpCache,
+    liked,
+    playlists,
+    history,
+    settings,
+    quota,
+  ];
+
+  /// Boxes that are pure cache and safe to nuke from Settings.
+  static const List<String> caches = <String>[httpCache, artistCatalog];
+
+  static Future<void> init() async {
+    await Hive.initFlutter('songly');
+    for (final String name in all) {
+      await Hive.openBox<dynamic>(name);
+    }
+  }
+
+  static Box<dynamic> box(String name) => Hive.box<dynamic>(name);
+
+  static Future<void> clearCaches() async {
+    for (final String name in caches) {
+      await box(name).clear();
+    }
+  }
+}
+
+final Provider<Box<dynamic>> settingsBoxProvider =
+    Provider<Box<dynamic>>((ref) => HiveBoxes.box(HiveBoxes.settings));
+
+final Provider<Box<dynamic>> resolverBoxProvider =
+    Provider<Box<dynamic>>((ref) => HiveBoxes.box(HiveBoxes.resolver));
+SONGLY_EOF
+
+echo "    lib/core/utils/debouncer.dart"
+cat > lib/core/utils/debouncer.dart <<'SONGLY_EOF'
+import 'dart:async';
+
+/// Search-as-you-type without hammering MusicBrainz.
+class Debouncer {
+  Debouncer({this.delay = const Duration(milliseconds: 400)});
+
+  final Duration delay;
+  Timer? _timer;
+
+  void run(void Function() action) {
+    _timer?.cancel();
+    _timer = Timer(delay, action);
+  }
+
+  void cancel() => _timer?.cancel();
+  void dispose() => _timer?.cancel();
+}
+SONGLY_EOF
+
+echo "    lib/core/utils/formatters.dart"
+cat > lib/core/utils/formatters.dart <<'SONGLY_EOF'
+/// Duration + label helpers.
+class Fmt {
+  const Fmt._();
+
+  /// 214000 -> "3:34"
+  static String duration(int? ms) {
+    if (ms == null || ms <= 0) return '--:--';
+    final int total = ms ~/ 1000;
+    final int h = total ~/ 3600;
+    final int m = (total % 3600) ~/ 60;
+    final int s = total % 60;
+    final String ss = s.toString().padLeft(2, '0');
+    if (h > 0) return '$h:${m.toString().padLeft(2, '0')}:$ss';
+    return '$m:$ss';
+  }
+
+  /// YouTube returns ISO-8601 durations: "PT3M34S" -> Duration.
+  static Duration? parseIso8601(String? iso) {
+    if (iso == null || iso.isEmpty) return null;
+    final RegExpMatch? m = RegExp(
+      r'^P(?:(\d+)D)?T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$',
+    ).firstMatch(iso);
+    if (m == null) return null;
+    return Duration(
+      days: int.tryParse(m.group(1) ?? '0') ?? 0,
+      hours: int.tryParse(m.group(2) ?? '0') ?? 0,
+      minutes: int.tryParse(m.group(3) ?? '0') ?? 0,
+      seconds: int.tryParse(m.group(4) ?? '0') ?? 0,
+    );
+  }
+
+  static String greeting([DateTime? now]) {
+    final int h = (now ?? DateTime.now()).hour;
+    if (h < 12) return 'Good morning';
+    if (h < 17) return 'Good afternoon';
+    return 'Good evening';
+  }
+}
+SONGLY_EOF
+
+echo "    lib/core/utils/text_normalizer.dart"
+cat > lib/core/utils/text_normalizer.dart <<'SONGLY_EOF'
+/// Title matching helpers used by the resolver (M3) to decide whether a YouTube
+/// video really is the song MusicBrainz told us about.
+class TextNormalizer {
+  const TextNormalizer._();
+
+  static final RegExp _brackets = RegExp(r'\(.*?\)|\[.*?\]');
+  static final RegExp _featuring = RegExp(r'\b(feat|ft|with)\.?\s.*');
+  static final RegExp _noise = RegExp(
+    r'\b(official|audio|video|lyrics?|lyrical|hd|4k|full|song|mv|m/v)\b',
+  );
+  static final RegExp _nonAlnum = RegExp(r'[^a-z0-9\s]');
+  static final RegExp _spaces = RegExp(r'\s+');
+
+  static String normalize(String input) => input
+      .toLowerCase()
+      .replaceAll(_brackets, ' ')
+      .replaceAll(_featuring, ' ')
+      .replaceAll(_noise, ' ')
+      .replaceAll(_nonAlnum, ' ')
+      .replaceAll(_spaces, ' ')
+      .trim();
+
+  static Set<String> tokens(String input) =>
+      normalize(input).split(' ').where((String t) => t.isNotEmpty).toSet();
+
+  /// Jaccard-ish token overlap in 0..1.
+  static double similarity(String a, String b) {
+    final Set<String> ta = tokens(a);
+    final Set<String> tb = tokens(b);
+    if (ta.isEmpty || tb.isEmpty) return 0;
+    final int inter = ta.intersection(tb).length;
+    return inter / (ta.length + tb.length - inter);
+  }
+
+  static const List<String> negativeKeywords = <String>[
+    'live', 'cover', 'karaoke', 'remix', 'reaction', 'slowed', 'reverb',
+    'nightcore', '8d', 'instrumental', 'mashup', 'tutorial', 'reversed',
+  ];
+
+  static bool looksLikeWrongVersion(String title) {
+    final String n = normalize(title);
+    return negativeKeywords.any((String k) => n.contains(k));
+  }
+}
+SONGLY_EOF
+
+echo "    lib/features/home/presentation/home_screen.dart"
+cat > lib/features/home/presentation/home_screen.dart <<'SONGLY_EOF'
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+
+import '../../../app/theme/app_theme.dart';
+import '../../../core/config/env.dart';
+import '../../../core/utils/formatters.dart';
+import '../../../shared/widgets/state_views.dart';
+
+class HomeScreen extends ConsumerWidget {
+  const HomeScreen({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        gradient: AppTheme.headerGradient(AppColors.accentAlt),
+      ),
+      child: CustomScrollView(
+        slivers: <Widget>[
+          SliverAppBar(
+            pinned: true,
+            backgroundColor: Colors.transparent,
+            title: Row(
+              children: <Widget>[
+                const Icon(Icons.graphic_eq_rounded, color: AppColors.accent),
+                const SizedBox(width: 8),
+                Text(Fmt.greeting()),
+              ],
+            ),
+            actions: <Widget>[
+              IconButton(
+                icon: const Icon(Icons.settings_outlined),
+                onPressed: () => context.push('/settings'),
+              ),
+            ],
+          ),
+          if (!Env.hasYouTubeKey)
+            const SliverToBoxAdapter(
+              child: NoticeBanner(
+                text: 'No YouTube API key found. Add it to dart_define.json and '
+                    'run with --dart-define-from-file=dart_define.json',
+                icon: Icons.key_off_rounded,
+              ),
+            ),
+          const SliverToBoxAdapter(child: SectionHeader(title: 'Recently played')),
+          const SliverToBoxAdapter(child: _PlaceholderRow()),
+          const SliverToBoxAdapter(child: SectionHeader(title: 'Made for you')),
+          const SliverToBoxAdapter(child: _PlaceholderRow(big: true)),
+          const SliverToBoxAdapter(child: SectionHeader(title: 'Browse genres')),
+          const SliverToBoxAdapter(child: _GenreGrid()),
+          const SliverToBoxAdapter(child: SizedBox(height: 32)),
+        ],
+      ),
+    );
+  }
+}
+
+class _PlaceholderRow extends StatelessWidget {
+  const _PlaceholderRow({this.big = false});
+
+  final bool big;
+
+  @override
+  Widget build(BuildContext context) {
+    final double side = big ? 150 : 120;
+    return SizedBox(
+      height: side + 52,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.symmetric(horizontal: 16),
+        itemCount: 5,
+        separatorBuilder: (_, __) => const SizedBox(width: 12),
+        itemBuilder: (BuildContext context, int i) => Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            ShimmerBox(width: side, height: side, radius: 12),
+            const SizedBox(height: 10),
+            ShimmerBox(width: side * 0.8, height: 12),
+            const SizedBox(height: 6),
+            ShimmerBox(width: side * 0.5, height: 10),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _GenreGrid extends StatelessWidget {
+  const _GenreGrid();
+
+  static const List<(String, Color)> _genres = <(String, Color)>[
+    ('Bollywood', Color(0xFFE8590C)),
+    ('Pop', Color(0xFF7C5CFF)),
+    ('Hip-Hop', Color(0xFF1098AD)),
+    ('Punjabi', Color(0xFFD6336C)),
+    ('Rock', Color(0xFF37B24D)),
+    ('Lo-fi', Color(0xFF5C7CFA)),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      child: GridView.count(
+        crossAxisCount: 2,
+        shrinkWrap: true,
+        physics: const NeverScrollableScrollPhysics(),
+        mainAxisSpacing: 12,
+        crossAxisSpacing: 12,
+        childAspectRatio: 2.1,
+        children: _genres
+            .map(
+              ((String, Color) g) => Container(
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    colors: <Color>[g.$2, g.$2.withValues(alpha: 0.55)],
+                  ),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                alignment: Alignment.topLeft,
+                child: Text(
+                  g.$1,
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w800,
+                    fontSize: 15,
+                  ),
+                ),
+              ),
+            )
+            .toList(),
+      ),
+    );
+  }
+}
+SONGLY_EOF
+
+echo "    lib/features/library/presentation/library_screen.dart"
+cat > lib/features/library/presentation/library_screen.dart <<'SONGLY_EOF'
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../../../app/theme/app_theme.dart';
+import '../../../core/storage/hive_boxes.dart';
+import '../../../shared/widgets/state_views.dart';
+
+class LibraryScreen extends ConsumerWidget {
+  const LibraryScreen({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final int liked = HiveBoxes.box(HiveBoxes.liked).length;
+    final int playlists = HiveBoxes.box(HiveBoxes.playlists).length;
+    final int history = HiveBoxes.box(HiveBoxes.history).length;
+
+    return DefaultTabController(
+      length: 3,
+      child: SafeArea(
+        child: Column(
+          children: <Widget>[
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 14, 16, 0),
+              child: Row(
+                children: <Widget>[
+                  Text(
+                    'Your Library',
+                    style: TextStyle(
+                      fontSize: 24,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: -0.6,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const TabBar(
+              isScrollable: true,
+              tabAlignment: TabAlignment.start,
+              labelColor: AppColors.accent,
+              unselectedLabelColor: AppColors.textDim,
+              indicatorColor: AppColors.accent,
+              dividerColor: Colors.transparent,
+              tabs: <Widget>[
+                Tab(text: 'Liked'),
+                Tab(text: 'Playlists'),
+                Tab(text: 'History'),
+              ],
+            ),
+            Expanded(
+              child: TabBarView(
+                children: <Widget>[
+                  liked == 0
+                      ? const EmptyView(
+                          icon: Icons.favorite_border_rounded,
+                          title: 'No liked songs yet',
+                          subtitle: 'Tap the heart on any song to save it here.',
+                        )
+                      : Center(child: Text('$liked liked songs')),
+                  playlists == 0
+                      ? const EmptyView(
+                          icon: Icons.queue_music_rounded,
+                          title: 'No playlists yet',
+                          subtitle: 'Playlists arrive in M5 - stored fully offline.',
+                        )
+                      : Center(child: Text('$playlists playlists')),
+                  history == 0
+                      ? const EmptyView(
+                          icon: Icons.history_rounded,
+                          title: 'Nothing played yet',
+                          subtitle: 'Your listening history will appear here.',
+                        )
+                      : Center(child: Text('$history plays')),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+SONGLY_EOF
+
+echo "    lib/features/player/presentation/mini_player.dart"
+cat > lib/features/player/presentation/mini_player.dart <<'SONGLY_EOF'
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../../../app/theme/app_theme.dart';
+
+/// Placeholder for "what is playing right now".
+/// M3 replaces this with the real PlayerHost notifier (keepAlive) that owns the
+/// single YoutubePlayerController.
+final Provider<PlayingStub?> currentTrackProvider =
+    Provider<PlayingStub?>((ref) => null);
+
+class PlayingStub {
+  const PlayingStub({required this.title, required this.artist});
+
+  final String title;
+  final String artist;
+}
+
+/// Docked mini player.
+///
+/// M0: renders nothing until something is playing, but it IS mounted inside the
+/// router shell - that is the whole point.
+/// M3: the ONE `YoutubePlayer` widget lives here, rendered as a small visible
+/// 16:9 tile (never Offstage - hidden webviews get throttled and the iFrame
+/// terms expect a visible embed). Tapping expands to the Now Playing screen.
+class MiniPlayer extends ConsumerWidget {
+  const MiniPlayer({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final PlayingStub? track = ref.watch(currentTrackProvider);
+    if (track == null) {
+      return const SizedBox.shrink();
+    }
+
+    return Container(
+      height: 64,
+      margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      padding: const EdgeInsets.only(right: 8),
+      decoration: BoxDecoration(
+        color: AppColors.surfaceHigh,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        children: <Widget>[
+          // ---- M3: YoutubePlayer goes in this slot ----
+          Container(
+            width: 96,
+            height: 54,
+            decoration: BoxDecoration(
+              color: Colors.black,
+              borderRadius: BorderRadius.circular(8),
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  track.title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontWeight: FontWeight.w700),
+                ),
+                Text(
+                  track.artist,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: AppColors.textDim,
+                    fontSize: 12,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.play_arrow_rounded),
+            onPressed: () {},
+          ),
+        ],
+      ),
+    );
+  }
+}
+SONGLY_EOF
+
+echo "    lib/features/resolver/domain/resolver_strategy.dart"
+cat > lib/features/resolver/domain/resolver_strategy.dart <<'SONGLY_EOF'
+/// The resolver turns a MusicBrainz recording into a playable YouTube videoId.
+///
+/// It is deliberately a CHAIN of pluggable strategies, tried cheapest-first, so
+/// the expensive one (keyword search) is the last resort and can be swapped or
+/// disabled without touching the rest of the app.
+///
+/// Implementations land in M3:
+///   1. CacheStrategy          - Hive `resolver` box, 0 cost, permanent
+///   2. MusicBrainzRelStrategy - MB "free streaming" url-rels, 0 cost
+///   3. ArtistCatalogStrategy  - fuzzy match against a harvested catalogue, 0 cost
+///   4. CatalogHarvestStrategy - channels.list + playlistItems.list (~1 unit/50 videos)
+///   5. SearchStrategy         - search.list, budget-gated (the scarce resource)
+///   6. ManualStrategy         - user picks from stored candidates, 0 cost
+class ResolveRequest {
+  const ResolveRequest({
+    required this.recordingMbid,
+    required this.title,
+    required this.artistName,
+    this.artistMbid,
+    this.durationMs,
+  });
+
+  final String recordingMbid;
+  final String title;
+  final String artistName;
+  final String? artistMbid;
+  final int? durationMs;
+}
+
+class ResolveResult {
+  const ResolveResult({
+    required this.videoId,
+    required this.score,
+    required this.source,
+    this.candidates = const <String>[],
+  });
+
+  final String videoId;
+  final double score;
+
+  /// Which strategy produced this, for the debug/quota screen.
+  final String source;
+
+  /// Extra candidates from the same paid search, so "wrong song?" costs nothing.
+  final List<String> candidates;
+}
+
+abstract interface class ResolverStrategy {
+  String get name;
+
+  /// Whether this strategy can run right now (e.g. search respects the budget).
+  Future<bool> canRun(ResolveRequest request);
+
+  /// Returns null to fall through to the next strategy.
+  Future<ResolveResult?> resolve(ResolveRequest request);
+}
+SONGLY_EOF
+
+echo "    lib/features/search/presentation/search_screen.dart"
+cat > lib/features/search/presentation/search_screen.dart <<'SONGLY_EOF'
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../../../app/theme/app_theme.dart';
+import '../../../core/utils/debouncer.dart';
+import '../../../shared/widgets/state_views.dart';
+
+class SearchScreen extends ConsumerStatefulWidget {
+  const SearchScreen({super.key});
+
+  @override
+  ConsumerState<SearchScreen> createState() => _SearchScreenState();
+}
+
+class _SearchScreenState extends ConsumerState<SearchScreen> {
+  final TextEditingController _controller = TextEditingController();
+  final Debouncer _debouncer = Debouncer();
+  String _query = '';
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    _debouncer.dispose();
+    super.dispose();
+  }
+
+  void _onChanged(String value) {
+    // 400ms debounce kills ~80% of would-be MusicBrainz calls. M1 hooks this
+    // up to the real search provider.
+    _debouncer.run(() {
+      if (mounted) setState(() => _query = value.trim());
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Column(
+        children: <Widget>[
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+            child: TextField(
+              controller: _controller,
+              onChanged: _onChanged,
+              textInputAction: TextInputAction.search,
+              decoration: InputDecoration(
+                hintText: 'Songs, artists or albums',
+                prefixIcon: const Icon(Icons.search_rounded),
+                suffixIcon: _controller.text.isEmpty
+                    ? null
+                    : IconButton(
+                        icon: const Icon(Icons.close_rounded),
+                        onPressed: () {
+                          _controller.clear();
+                          _onChanged('');
+                        },
+                      ),
+              ),
+            ),
+          ),
+          Expanded(
+            child: _query.isEmpty
+                ? const EmptyView(
+                    icon: Icons.travel_explore_rounded,
+                    title: 'Search MusicBrainz',
+                    subtitle:
+                        'Millions of songs, artists and albums.\nSearch wiring lands in M1.',
+                  )
+                : ListView(
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    children: <Widget>[
+                      Text(
+                        'Results for "$_query"',
+                        style: const TextStyle(color: AppColors.textDim),
+                      ),
+                      const SizedBox(height: 16),
+                      for (int i = 0; i < 8; i++)
+                        const Padding(
+                          padding: EdgeInsets.only(bottom: 14),
+                          child: Row(
+                            children: <Widget>[
+                              ShimmerBox(width: 52, height: 52, radius: 8),
+                              SizedBox(width: 12),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: <Widget>[
+                                    ShimmerBox(height: 13),
+                                    SizedBox(height: 8),
+                                    ShimmerBox(width: 120, height: 11),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                    ],
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+SONGLY_EOF
+
+echo "    lib/features/settings/presentation/settings_screen.dart"
+cat > lib/features/settings/presentation/settings_screen.dart <<'SONGLY_EOF'
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../../../app/theme/app_theme.dart';
+import '../../../core/config/env.dart';
+import '../../../core/network/dio_client.dart';
+import '../../../core/network/quota_ledger.dart';
+import '../../../core/storage/hive_boxes.dart';
+
+/// M0 smoke test screen: if this renders real numbers, then Env (--dart-define),
+/// Hive, Riverpod providers and the router are all wired correctly.
+class SettingsScreen extends ConsumerStatefulWidget {
+  const SettingsScreen({super.key});
+
+  @override
+  ConsumerState<SettingsScreen> createState() => _SettingsScreenState();
+}
+
+class _SettingsScreenState extends ConsumerState<SettingsScreen> {
+  @override
+  Widget build(BuildContext context) {
+    final QuotaLedger ledger = ref.watch(quotaLedgerProvider);
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Settings')),
+      body: ListView(
+        children: <Widget>[
+          _Header('YouTube lookup budget'),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: LinearProgressIndicator(
+                    value: ledger.searchFraction,
+                    minHeight: 10,
+                    backgroundColor: AppColors.surfaceHigh,
+                    color: ledger.canSearch ? AppColors.accent : AppColors.danger,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  '${ledger.searchesToday} of ${ledger.searchCap} searches used today  '
+                  '(${ledger.unitsToday} cheap units)',
+                  style: const TextStyle(color: AppColors.textDim, fontSize: 12.5),
+                ),
+                const SizedBox(height: 6),
+                const Text(
+                  'Searches are the scarce resource. Songly resolves whole artist '
+                  'catalogues with 1-unit calls and caches every match forever, so '
+                  'most playback costs nothing.',
+                  style: TextStyle(color: AppColors.textDim, fontSize: 12),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 8),
+          ListTile(
+            leading: const Icon(Icons.key_rounded),
+            title: const Text('YouTube API key'),
+            subtitle: Text(
+              Env.hasYouTubeKey
+                  ? 'Loaded from build config'
+                  : 'Missing - add it to dart_define.json',
+            ),
+            trailing: Icon(
+              Env.hasYouTubeKey ? Icons.check_circle_rounded : Icons.error_rounded,
+              color: Env.hasYouTubeKey ? AppColors.accent : AppColors.danger,
+            ),
+          ),
+          const Divider(),
+          _Header('Storage'),
+          for (final String name in HiveBoxes.all)
+            ListTile(
+              dense: true,
+              leading: const Icon(Icons.storage_rounded, size: 18),
+              title: Text(name),
+              trailing: Text('${HiveBoxes.box(name).length}'),
+            ),
+          ListTile(
+            leading: const Icon(Icons.cleaning_services_rounded),
+            title: const Text('Clear caches'),
+            subtitle: Text('${cachedResponseCount()} cached responses'),
+            onTap: () async {
+              await HiveBoxes.clearCaches();
+              if (!mounted) return;
+              setState(() {});
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('Caches cleared')),
+              );
+            },
+          ),
+          const Divider(),
+          _Header('About'),
+          ListTile(
+            leading: const Icon(Icons.info_outline_rounded),
+            title: const Text('Songly'),
+            subtitle: Text(
+              'v${Env.appVersion}\nMetadata by MusicBrainz - playback via the '
+              'YouTube iFrame Player.',
+            ),
+          ),
+          const ListTile(
+            leading: Icon(Icons.visibility_outlined),
+            title: Text('Playback stays on screen'),
+            subtitle: Text(
+              'Songly plays through YouTube, so the player must stay visible. '
+              'Picture-in-picture support arrives in M7 for multitasking.',
+            ),
+          ),
+          const SizedBox(height: 32),
+        ],
+      ),
+    );
+  }
+}
+
+class _Header extends StatelessWidget {
+  const _Header(this.text);
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 20, 16, 10),
+      child: Text(
+        text.toUpperCase(),
+        style: const TextStyle(
+          fontSize: 11.5,
+          fontWeight: FontWeight.w800,
+          letterSpacing: 1.2,
+          color: AppColors.textDim,
+        ),
+      ),
+    );
+  }
+}
+SONGLY_EOF
+
+echo "    lib/main.dart"
+cat > lib/main.dart <<'SONGLY_EOF'
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import 'app/app.dart';
+import 'core/storage/hive_boxes.dart';
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await HiveBoxes.init();
+  runApp(const ProviderScope(child: SonglyApp()));
+}
+SONGLY_EOF
+
+echo "    lib/shared/widgets/app_shell.dart"
+cat > lib/shared/widgets/app_shell.dart <<'SONGLY_EOF'
+import 'package:flutter/material.dart';
+import 'package:go_router/go_router.dart';
+
+import '../../app/theme/app_theme.dart';
+import '../../features/player/presentation/mini_player.dart';
+
+/// The persistent chrome: mini player + bottom nav.
+///
+/// Because this widget lives in the router's shell, it is built ONCE. In M3 the
+/// single YoutubePlayer widget goes inside [MiniPlayer], so playback survives
+/// every tab switch and page push.
+class AppShell extends StatelessWidget {
+  const AppShell({super.key, required this.shell});
+
+  final StatefulNavigationShell shell;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: shell,
+      bottomNavigationBar: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          const MiniPlayer(),
+          DecoratedBox(
+            decoration: const BoxDecoration(
+              border: Border(top: BorderSide(color: Color(0xFF23232E))),
+            ),
+            child: NavigationBar(
+              selectedIndex: shell.currentIndex,
+              onDestinationSelected: (int index) => shell.goBranch(
+                index,
+                initialLocation: index == shell.currentIndex,
+              ),
+              destinations: const <NavigationDestination>[
+                NavigationDestination(
+                  icon: Icon(Icons.home_outlined),
+                  selectedIcon: Icon(Icons.home_rounded, color: AppColors.accent),
+                  label: 'Home',
+                ),
+                NavigationDestination(
+                  icon: Icon(Icons.search_outlined),
+                  selectedIcon: Icon(Icons.search_rounded, color: AppColors.accent),
+                  label: 'Search',
+                ),
+                NavigationDestination(
+                  icon: Icon(Icons.library_music_outlined),
+                  selectedIcon:
+                      Icon(Icons.library_music_rounded, color: AppColors.accent),
+                  label: 'Library',
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+SONGLY_EOF
+
+echo "    lib/shared/widgets/state_views.dart"
+cat > lib/shared/widgets/state_views.dart <<'SONGLY_EOF'
+import 'package:flutter/material.dart';
+
+import '../../app/theme/app_theme.dart';
+
+/// Pulsing placeholder block (no extra shimmer package needed).
+class ShimmerBox extends StatefulWidget {
+  const ShimmerBox({
+    super.key,
+    this.width = double.infinity,
+    this.height = 16,
+    this.radius = 8,
+  });
+
+  final double width;
+  final double height;
+  final double radius;
+
+  @override
+  State<ShimmerBox> createState() => _ShimmerBoxState();
+}
+
+class _ShimmerBoxState extends State<ShimmerBox>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 900),
+  )..repeat(reverse: true);
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FadeTransition(
+      opacity: Tween<double>(begin: 0.35, end: 0.85).animate(_c),
+      child: Container(
+        width: widget.width,
+        height: widget.height,
+        decoration: BoxDecoration(
+          color: AppColors.surfaceHigh,
+          borderRadius: BorderRadius.circular(widget.radius),
+        ),
+      ),
+    );
+  }
+}
+
+class ErrorView extends StatelessWidget {
+  const ErrorView({super.key, required this.message, this.onRetry});
+
+  final String message;
+  final VoidCallback? onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: <Widget>[
+            const Icon(Icons.cloud_off_rounded, size: 44, color: AppColors.textDim),
+            const SizedBox(height: 14),
+            Text(
+              message,
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: AppColors.textDim),
+            ),
+            if (onRetry != null) ...<Widget>[
+              const SizedBox(height: 18),
+              FilledButton.tonal(onPressed: onRetry, child: const Text('Retry')),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class EmptyView extends StatelessWidget {
+  const EmptyView({
+    super.key,
+    required this.icon,
+    required this.title,
+    this.subtitle,
+  });
+
+  final IconData icon;
+  final String title;
+  final String? subtitle;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: <Widget>[
+            Icon(icon, size: 46, color: AppColors.textDim),
+            const SizedBox(height: 14),
+            Text(
+              title,
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+            ),
+            if (subtitle != null) ...<Widget>[
+              const SizedBox(height: 6),
+              Text(
+                subtitle!,
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: AppColors.textDim, fontSize: 13),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Small banner used for quota / offline notices.
+class NoticeBanner extends StatelessWidget {
+  const NoticeBanner({
+    super.key,
+    required this.text,
+    this.icon = Icons.info_outline_rounded,
+    this.action,
+    this.color = AppColors.accentAlt,
+  });
+
+  final String text;
+  final IconData icon;
+  final Widget? action;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: color.withValues(alpha: 0.35)),
+      ),
+      child: Row(
+        children: <Widget>[
+          Icon(icon, size: 18, color: color),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(text, style: const TextStyle(fontSize: 12.5)),
+          ),
+          if (action != null) action!,
+        ],
+      ),
+    );
+  }
+}
+
+class SectionHeader extends StatelessWidget {
+  const SectionHeader({super.key, required this.title, this.trailing});
+
+  final String title;
+  final Widget? trailing;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 20, 8, 12),
+      child: Row(
+        children: <Widget>[
+          Expanded(
+            child: Text(
+              title,
+              style: const TextStyle(
+                fontSize: 19,
+                fontWeight: FontWeight.w800,
+                letterSpacing: -0.4,
+              ),
+            ),
+          ),
+          if (trailing != null) trailing!,
+        ],
+      ),
+    );
+  }
+}
+SONGLY_EOF
+
+echo "    tools/mb_proxy.dart"
+cat > tools/mb_proxy.dart <<'SONGLY_EOF'
+// Dev-only helper for the Raspberry Pi.
+//
+// Browsers refuse to let Flutter web set a User-Agent header, but MusicBrainz
+// requires one. Run this proxy while developing in Chromium:
+//
+//   dart run tools/mb_proxy.dart
+//   flutter run -d chrome --dart-define-from-file=dart_define.json \
+//     --dart-define=MB_BASE_URL=http://localhost:8787/ws/2
+//
+// It also adds CORS headers so the browser stops complaining.
+import 'dart:io';
+
+Future<void> main(List<String> args) async {
+  const int port = 8787;
+  const String contact = 'you@example.com'; // <- put your real contact here
+  final HttpClient client = HttpClient();
+  final HttpServer server = await HttpServer.bind(InternetAddress.anyIPv4, port);
+  stdout.writeln('MusicBrainz dev proxy on http://localhost:$port');
+
+  await for (final HttpRequest req in server) {
+    try {
+      if (req.method == 'OPTIONS') {
+        _cors(req.response);
+        await req.response.close();
+        continue;
+      }
+      final Uri target = Uri.parse(
+        'https://musicbrainz.org${req.uri.path}'
+        '${req.uri.hasQuery ? '?${req.uri.query}' : ''}',
+      );
+      final HttpClientRequest forward = await client.getUrl(target);
+      forward.headers.set('User-Agent', 'Songly-dev/1.0 ( $contact )');
+      forward.headers.set('Accept', 'application/json');
+      final HttpClientResponse upstream = await forward.close();
+
+      _cors(req.response);
+      req.response.statusCode = upstream.statusCode;
+      req.response.headers.contentType = ContentType.json;
+      await upstream.pipe(req.response);
+    } catch (e) {
+      _cors(req.response);
+      req.response.statusCode = HttpStatus.badGateway;
+      req.response.write('{"error":"$e"}');
+      await req.response.close();
+    }
+  }
+}
+
+void _cors(HttpResponse res) {
+  res.headers
+    ..set('Access-Control-Allow-Origin', '*')
+    ..set('Access-Control-Allow-Headers', '*')
+    ..set('Access-Control-Allow-Methods', 'GET,OPTIONS');
+}
+SONGLY_EOF
+
+
+echo "==> Secrets: dart_define.json (git-ignored)"
+if [ ! -f dart_define.json ]; then
+cat > dart_define.json <<'SONGLY_EOF'
+{
+  "YT_API_KEY": "PASTE_YOUR_YOUTUBE_DATA_API_V3_KEY",
+  "MB_CONTACT": "you@example.com",
+  "APP_VERSION": "1.0.0"
+}
+SONGLY_EOF
+  echo "    created dart_define.json - PUT YOUR KEY + EMAIL IN IT"
+else
+  echo "    dart_define.json already exists, leaving it alone"
+fi
+
+if ! grep -q "dart_define.json" .gitignore 2>/dev/null; then
+cat >> .gitignore <<'SONGLY_EOF'
+
+# Songly secrets & local config
+dart_define.json
+*.jks
+*.keystore
+key.properties
+.env
+SONGLY_EOF
+  echo "    .gitignore updated"
+fi
+
+echo "==> Patching AndroidManifest for INTERNET permission"
+python3 - <<'SONGLY_EOF'
+import os
+p = 'android/app/src/main/AndroidManifest.xml'
+if not os.path.exists(p):
+    print('    manifest not found, skipping (run flutter create . if needed)')
+else:
+    s = open(p).read()
+    if 'android.permission.INTERNET' in s:
+        print('    INTERNET permission already present')
+    else:
+        s = s.replace('<application',
+              '    <uses-permission android:name="android.permission.INTERNET"/>\n\n    <application', 1)
+        open(p, 'w').write(s)
+        print('    added INTERNET permission (release APKs need this explicitly!)')
+SONGLY_EOF
+
+echo "==> Resolving and analyzing"
+flutter pub get
+flutter analyze --no-fatal-infos || echo "    (analyze reported issues - see above)"
+
+cat <<'SONGLY_EOF'
+
+==========================================================================
+ M0 done. Run it:
+
+   flutter run -d chrome --dart-define-from-file=dart_define.json
+
+ In IntelliJ: Run > Edit Configurations > Additional run args:
+   --dart-define-from-file=dart_define.json
+
+ Smoke test: Home renders, tabs switch, Settings shows real Hive box counts
+ and says whether your YouTube key was picked up. That proves Env + Hive +
+ Riverpod + go_router shell are all wired.
+
+ Then push and let Codemagic build the first APK:
+   git checkout -b dev
+   git add -A && git commit -m "feat(m0): foundations - theme, shell, network, storage"
+   git push -u origin dev
+==========================================================================
+SONGLY_EOF
